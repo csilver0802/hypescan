@@ -2,16 +2,19 @@
 """
 HyperliquidFetcher: polls Hyperliquid /info POST endpoints to retrieve
 funding rate and open interest for configured symbols and updates EnrichmentStore.
+Instrumented with Prometheus metrics and StatusStore updates.
 """
 import asyncio
-import json
 import logging
 import os
 import time
 from typing import List, Dict, Optional
 
 import aiohttp
+
 from enrichment import EnrichmentStore
+from metrics import api_request_latency_seconds, funding_fetch_success, funding_fetch_failure, oi_fetch_success, oi_fetch_failure, set_stale_seconds
+from status import StatusStore
 
 LOG = logging.getLogger("hyperliquid_fetcher")
 LOG.setLevel(logging.INFO)
@@ -25,6 +28,7 @@ class HyperliquidFetcher:
         self,
         store: EnrichmentStore,
         symbols: List[str],
+        status_store: StatusStore,
         base_url: str = None,
         funding_path: str = None,
         oi_path: str = None,
@@ -35,6 +39,7 @@ class HyperliquidFetcher:
     ):
         self.store = store
         self.symbols = [s.upper() for s in symbols]
+        self.status_store = status_store
         self.base_url = base_url or os.getenv("HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz")
         self.funding_path = funding_path or os.getenv("HYPERLIQUID_FUNDING_PATH", "/info")
         self.oi_path = oi_path or os.getenv("HYPERLIQUID_OI_PATH", "/info")
@@ -66,11 +71,14 @@ class HyperliquidFetcher:
     async def _post_json(self, url: str, payload: dict) -> Dict:
         backoff = 0.5
         last_exc = None
+        start = time.time()
         for attempt in range(1, self.retries + 1):
             try:
                 async with self._session.post(url, json=payload, timeout=self.timeout) as resp:
                     resp.raise_for_status()
                     js = await resp.json()
+                    latency = time.time() - start
+                    api_request_latency_seconds.labels(service='hyperliquid').observe(latency)
                     return js
             except Exception as exc:
                 last_exc = exc
@@ -89,7 +97,6 @@ class HyperliquidFetcher:
             fund_payload = {"type": "fundingHistory", "coin": symbol, "limit": 1}
             fund_res = await self._post_json(fund_url, fund_payload)
         else:
-            # fallback GET
             async with self._session.get(fund_url.format(symbol=symbol), timeout=self.timeout) as r:
                 r.raise_for_status()
                 fund_res = await r.json()
@@ -108,7 +115,6 @@ class HyperliquidFetcher:
         # map common keys
         try:
             if isinstance(fund_res, dict):
-                # fundingHistory may return list; try to extract latest entry
                 if "funding_rate" in fund_res:
                     funding = fund_res.get("funding_rate")
                 elif isinstance(fund_res.get("data"), list) and len(fund_res.get("data")) > 0:
@@ -122,7 +128,6 @@ class HyperliquidFetcher:
         try:
             if isinstance(oi_res, dict):
                 open_interest = oi_res.get("open_interest") or oi_res.get("oi") or oi_res.get("openInterest")
-                # some responses nest under 'data'
                 if open_interest is None and isinstance(oi_res.get("data"), dict):
                     open_interest = oi_res.get("data").get("open_interest")
         except Exception:
@@ -143,10 +148,33 @@ class HyperliquidFetcher:
                     "src_ts": data["src_ts"],
                     "raw": data.get("raw")
                 }
+                # Update enrichment store
                 await self.store.set(symbol, normalized)
+
+                # Metrics: success counters
+                if normalized.get("funding") is not None:
+                    funding_fetch_success.labels(symbol=symbol).inc()
+                else:
+                    funding_fetch_failure.labels(symbol=symbol).inc()
+
+                if normalized.get("open_interest") is not None:
+                    oi_fetch_success.labels(symbol=symbol).inc()
+                else:
+                    oi_fetch_failure.labels(symbol=symbol).inc()
+
+                # Update status store
+                await self.status_store.set_enrichment(symbol, normalized["src_ts"])
+
+                # Reset stale gauge for symbol
+                set_stale_seconds(symbol, 0.0)
+
                 LOG.debug("Updated enrichment for %s: funding=%s oi=%s", symbol, normalized["funding"], normalized["open_interest"])
             except Exception as exc:
                 LOG.exception("Exception while fetching enrichment for %s: %s", symbol, exc)
+                # Metrics: failure
+                funding_fetch_failure.labels(symbol=symbol).inc()
+                oi_fetch_failure.labels(symbol=symbol).inc()
+                await self.status_store.set_fetcher_error(symbol, time.time())
             elapsed = time.time() - start
             to_sleep = max(0.0, self.poll_interval - elapsed)
             await asyncio.sleep(to_sleep)

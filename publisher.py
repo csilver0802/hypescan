@@ -1,17 +1,24 @@
 # publisher.py
 """
 Publisher: consumes ingestion queue, merges enrichment, publishes to Redis and persists to Postgres.
+Instrumented with Prometheus metrics and StatusStore updates.
 """
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
 from typing import List, Dict, Any, Optional
 
 import asyncpg
 import aioredis
+
+from metrics import (
+    liquidation_events_received,
+    redis_publish_errors,
+    postgres_write_errors,
+)
+from status import StatusStore
 
 LOG = logging.getLogger("publisher")
 LOG.setLevel(logging.INFO)
@@ -29,6 +36,7 @@ class Publisher:
         batch_size: int = 50,
         batch_interval: float = 1.0,
         enrichment_store: Optional[Any] = None,
+        status_store: Optional[StatusStore] = None,
     ):
         self.queue = queue
         self.redis_url = redis_url
@@ -40,6 +48,7 @@ class Publisher:
         self._pg_pool = None
         self._stop = asyncio.Event()
         self.enrichment_store = enrichment_store
+        self.status_store = status_store
 
     async def start(self):
         await self._connect_redis()
@@ -51,9 +60,13 @@ class Publisher:
             try:
                 self._redis = await aioredis.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
                 LOG.info("Connected to Redis at %s", self.redis_url)
+                if self.status_store:
+                    await self.status_store.set_redis_connected(True)
                 return
             except Exception as e:
                 LOG.warning("Redis connect failed: %s; retrying in %.1fs", e, backoff)
+                if self.status_store:
+                    await self.status_store.set_redis_connected(False)
                 await asyncio.sleep(backoff)
                 backoff = min(30.0, backoff * 2)
 
@@ -63,9 +76,13 @@ class Publisher:
             try:
                 self._pg_pool = await asyncpg.create_pool(dsn=self.pg_dsn, min_size=1, max_size=10)
                 LOG.info("Connected to Postgres")
+                if self.status_store:
+                    await self.status_store.set_db_connected(True)
                 return
             except Exception as e:
                 LOG.warning("Postgres connect failed: %s; retrying in %.1fs", e, backoff)
+                if self.status_store:
+                    await self.status_store.set_db_connected(False)
                 await asyncio.sleep(backoff)
                 backoff = min(30.0, backoff * 2)
 
@@ -108,12 +125,10 @@ class Publisher:
             await self._flush(buffer)
 
     async def _flush(self, buffer: List[Dict[str, Any]]):
-        # publish to redis and persist to postgres
         records = []
         for ev in buffer:
             symbol = ev.get("symbol", "unknown").upper()
             channel = f"raw:binance:{symbol}"
-            # merge enrichment
             if self.enrichment_store:
                 try:
                     enrichment = await self.enrichment_store.get(symbol)
@@ -132,11 +147,13 @@ class Publisher:
                 await self._redis.publish(channel, payload)
             except Exception:
                 LOG.exception("Failed to publish to Redis; attempting reconnect")
+                redis_publish_errors.labels(symbol=symbol).inc()
                 await self._connect_redis()
                 try:
                     await self._redis.publish(channel, payload)
                 except Exception:
                     LOG.exception("Redis publish retry failed for channel %s", channel)
+                    redis_publish_errors.labels(symbol=symbol).inc()
             rec_id = str(uuid.uuid4())
             source = ev.get("source", "binance_futures")
             received_at = ev.get("ts", time.time())
@@ -155,9 +172,16 @@ class Publisher:
                 async with conn.transaction():
                     for rec in records:
                         await conn.execute(insert_sql, *rec)
+            # metrics: count events persisted
+            for _ in records:
+                liquidation_events_received.inc()
             LOG.info("Flushed %d events to Postgres and published to Redis", len(records))
+            # update last_liquidation_event timestamp
+            if self.status_store:
+                await self.status_store.set_last_liquidation_event(time.time())
         except Exception as e:
             LOG.exception("Failed to persist batch to Postgres: %s", e)
+            postgres_write_errors.labels(table='raw_events').inc()
             try:
                 await self._connect_postgres()
             except Exception:

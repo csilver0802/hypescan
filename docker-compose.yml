@@ -52,6 +52,9 @@ services:
       - HYPERLIQUID_API_KEY=${HYPERLIQUID_API_KEY:-}
       - HYPERLIQUID_API_SECRET=${HYPERLIQUID_API_SECRET:-}
 
+      - METRICS_PORT=${METRICS_PORT:-8000}
+    ports:
+      - "${METRICS_PORT:-8000}:8000"
     restart: unless-stopped
     deploy:
       resources:
