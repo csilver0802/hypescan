@@ -1,0 +1,5 @@
+# Replit config: run the app directly without Docker (Replit does not fully support Docker Compose).
+# This is a best-effort configuration to run in Replit. For Codespaces use Docker Compose.
+
+run = "bash start-replit.sh"
+

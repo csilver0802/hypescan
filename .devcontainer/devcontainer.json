@@ -1,0 +1,18 @@
+{
+  "name": "HypeScan Codespace",
+  "image": "mcr.microsoft.com/devcontainers/python:0-3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker": {
+      "version": "1"
+    }
+  },
+  "postStartCommand": "docker compose up --build -d",
+  "forwardPorts": [8000],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}
